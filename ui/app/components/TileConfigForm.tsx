@@ -1,0 +1,929 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { useDql } from "@dynatrace-sdk/react-hooks";
+import { useCurrentTheme } from "@dynatrace/strato-components/core";
+import { Flex } from "@dynatrace/strato-components/layouts";
+import { Text } from "@dynatrace/strato-components/typography";
+import { Button } from "@dynatrace/strato-components/buttons";
+import { RunQueryButton, type QueryStateType } from "@dynatrace/strato-components-preview/buttons";
+import { CodeEditor, DQLEditor } from "@dynatrace/strato-components-preview/editors";
+import { PlusIcon } from "@dynatrace/strato-icons";
+import Colors from "@dynatrace/strato-design-tokens/colors";
+import type { DocumentMetaData } from "@dynatrace-sdk/client-document";
+import {
+  AGGREGATIONS,
+  DEFAULT_DQL_DISPLAY,
+  DEFAULT_LOOKBACK,
+  DEFAULT_TILE_SHAPE,
+  DEFAULT_VALUE_POSITION,
+  DQL_DISPLAY_OPTIONS,
+  generateId,
+  isLineTileShape,
+  isOutlineTileShape,
+  LINE_ARROW_OPTIONS,
+  LOOKBACK_OPTIONS,
+  STATIC_ONLY_SHAPES,
+  THRESHOLD_COLOR_PRESETS,
+  TILE_SHAPES,
+  VALUE_POSITION_OPTIONS,
+  type AggregationType,
+  type DqlDisplay,
+  type LineArrows,
+  type LookbackWindow,
+  type Threshold,
+  type TileFilter,
+  type TileLink,
+  type TileShape,
+  type TileSource,
+  type ValuePosition,
+} from "../types/metricsView";
+import {
+  dimensionKeysFromRecord,
+  dimensionProbeQuery,
+  readDqlCell,
+  validateDqlResult,
+  validateDqlTable,
+} from "../services/metricsQuery";
+import { listViews } from "../services/documentService";
+import { ColumnPicker } from "./ColumnPicker";
+import { ConfigSection } from "./ConfigSection";
+import { FilterRow } from "./FilterRow";
+import { ThresholdRow } from "./ThresholdRow";
+import { NativeInput } from "./NativeField";
+import { SelectField } from "./SelectField";
+import { ShapeGlyph } from "./TileShapeLayer";
+
+export interface TileConfig {
+  source: TileSource;
+  metricKey?: string;
+  aggregation?: AggregationType;
+  lookback?: LookbackWindow;
+  dql?: string;
+  dqlDisplay?: DqlDisplay;
+  tableColumns?: string[];
+  markdown?: string;
+  shape: TileShape;
+  rotation?: number;
+  lineWeight?: number;
+  lineDashed?: boolean;
+  lineArrows?: LineArrows;
+  shapeOnly: boolean;
+  transparent: boolean;
+  backgroundColor?: string;
+  valuePosition?: ValuePosition;
+  filters: TileFilter[];
+  thresholds: Threshold[];
+  label?: string;
+  unit?: string;
+  link?: TileLink;
+}
+
+type LinkChoice = "none" | "view" | "url";
+type TestState = { status: "idle" | "running" | "ok" | "error"; message: string };
+
+interface TileConfigFormProps {
+  /** Whether the tile is metric-based or uses a custom DQL query. */
+  source: TileSource;
+  /** Metric key (metric source only). */
+  metricKey?: string;
+  initial?: Partial<TileConfig>;
+  submitLabel: string;
+  /** Current view's id, excluded from the drill-down canvas list. */
+  currentViewId?: string;
+  onSubmit: (config: TileConfig) => void;
+  onCancel?: () => void;
+}
+
+const fieldLabelStyle: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 600,
+  color: Colors.Text.Neutral.Default,
+};
+
+/** Clamp/normalize a user-entered rotation string into 0–359 degrees. */
+function normalizeAngle(input: string): number {
+  const n = Math.round(Number(input));
+  if (!Number.isFinite(n)) return 0;
+  return ((n % 360) + 360) % 360;
+}
+
+/** Color of the shape picker glyphs and captions (light / dark mode). */
+const SHAPE_PICKER_COLOR_LIGHT = "#3b3fbe";
+const SHAPE_PICKER_COLOR_DARK = "#b8bbff";
+
+/** Compact captions for the shape picker buttons. */
+const SHORT_SHAPE_LABELS: Record<TileShape, string> = {
+  rectangle: "Rectangle",
+  rounded: "Rounded",
+  circle: "Circle",
+  triangle: "Triangle",
+  diamond: "Diamond",
+  cloud: "Cloud",
+  server: "Server",
+  application: "App",
+  database: "Database",
+  user: "User",
+  users: "Users",
+  globe: "Globe",
+  laptop: "Laptop",
+  mobile: "Mobile",
+  document: "Document",
+  shield: "Shield",
+  line: "Line",
+  arrow: "Arrow",
+};
+
+export const TileConfigForm: React.FC<TileConfigFormProps> = ({
+  source,
+  metricKey,
+  initial,
+  submitLabel,
+  currentViewId,
+  onSubmit,
+  onCancel,
+}) => {
+  const isDql = source === "dql";
+  const isMarkdown = source === "markdown";
+  const isShape = source === "shape";
+  const shapePickerColor =
+    useCurrentTheme() === "dark"
+      ? SHAPE_PICKER_COLOR_DARK
+      : SHAPE_PICKER_COLOR_LIGHT;
+  const [aggregation, setAggregation] = useState<AggregationType>(
+    initial?.aggregation ?? "avg",
+  );
+  const [lookback, setLookback] = useState<LookbackWindow>(
+    initial?.lookback ?? DEFAULT_LOOKBACK,
+  );
+  const [dql, setDql] = useState<string>(initial?.dql ?? "");
+  const [dqlDisplay, setDqlDisplay] = useState<DqlDisplay>(
+    initial?.dqlDisplay ?? DEFAULT_DQL_DISPLAY,
+  );
+  const [tableColumns, setTableColumns] = useState<string[]>(
+    initial?.tableColumns ?? [],
+  );
+  // Fields discovered from the last successful table test — the pool the column
+  // picker chooses from. Seeded with any saved columns so the picker isn't empty
+  // before the auto-test finishes when editing an existing table tile.
+  const [tableFields, setTableFields] = useState<string[]>(
+    initial?.tableColumns ?? [],
+  );
+  const [markdown, setMarkdown] = useState<string>(initial?.markdown ?? "");
+  const [test, setTest] = useState<TestState>({ status: "idle", message: "" });
+  const [shape, setShape] = useState<TileShape>(
+    // Legacy "arrow" shape is now "line" with an end arrowhead.
+    initial?.shape === "arrow" ? "line" : initial?.shape ?? DEFAULT_TILE_SHAPE,
+  );
+  const [rotation, setRotation] = useState<number>(initial?.rotation ?? 0);
+  const [lineWeight, setLineWeight] = useState<number>(
+    initial?.lineWeight ?? 4,
+  );
+  const [lineDashed, setLineDashed] = useState<boolean>(
+    initial?.lineDashed ?? false,
+  );
+  const [lineArrows, setLineArrows] = useState<LineArrows>(
+    initial?.lineArrows ?? (initial?.shape === "arrow" ? "end" : "none"),
+  );
+  const [shapeOnly, setShapeOnly] = useState<boolean>(
+    initial?.shapeOnly ?? false,
+  );
+  const [valuePosition, setValuePosition] = useState<ValuePosition>(
+    initial?.valuePosition ?? DEFAULT_VALUE_POSITION,
+  );
+  const [bgMode, setBgMode] = useState<"default" | "transparent" | "custom">(
+    initial?.transparent
+      ? "transparent"
+      : initial?.backgroundColor
+        ? "custom"
+        : "default",
+  );
+  const [bgColor, setBgColor] = useState<string>(
+    initial?.backgroundColor ?? "#134fc9",
+  );
+  // Table tiles reuse the tile `transparent` flag as a "show only gridlines &
+  // values" toggle (no solid table block behind the cells).
+  const [tableTransparent, setTableTransparent] = useState<boolean>(
+    initial?.transparent ?? false,
+  );
+  const [filters, setFilters] = useState<TileFilter[]>(initial?.filters ?? []);
+  const [thresholds, setThresholds] = useState<Threshold[]>(
+    initial?.thresholds ?? [],
+  );
+  const [label, setLabel] = useState<string>(initial?.label ?? "");
+  const [unit, setUnit] = useState<string>(initial?.unit ?? "");
+
+  const [linkChoice, setLinkChoice] = useState<LinkChoice>(
+    initial?.link?.type ?? "none",
+  );
+  const [linkView, setLinkView] = useState<string>(
+    initial?.link?.type === "view" ? initial.link.target : "",
+  );
+  const [linkUrl, setLinkUrl] = useState<string>(
+    initial?.link?.type === "url" ? initial.link.target : "",
+  );
+  const [views, setViews] = useState<DocumentMetaData[] | null>(null);
+
+  // Load the list of canvases lazily when the user chooses a canvas link.
+  useEffect(() => {
+    if (linkChoice !== "view" || views !== null) return;
+    let active = true;
+    listViews()
+      .then((docs) => active && setViews(docs))
+      .catch(() => active && setViews([]));
+    return () => {
+      active = false;
+    };
+  }, [linkChoice, views]);
+
+  // Probe one series to discover this metric's dimension keys (metric source).
+  const { data } = useDql(
+    { query: metricKey ? dimensionProbeQuery(metricKey) : "" },
+    { enabled: !isDql && Boolean(metricKey) },
+  );
+
+  const dimensionOptions = useMemo(() => {
+    const records =
+      (data?.records as Array<Record<string, unknown>> | undefined) ?? [];
+    return dimensionKeysFromRecord(records[0]);
+  }, [data]);
+
+  // Deferred query used to test/validate a custom DQL query on demand.
+  const dqlTest = useDql({ query: dql }, { enabled: false });
+
+  async function runDqlTest() {
+    const q = dql.trim();
+    if (!q) return;
+    setTest({ status: "running", message: "Running query…" });
+    try {
+      const result = await dqlTest.refetch();
+      const records = result.data?.records as
+        | Array<Record<string, unknown>>
+        | undefined;
+      if (dqlDisplay === "table") {
+        const validation = validateDqlTable(records);
+        setTableFields(validation.fields);
+        // Default to all fields on first successful test; otherwise keep the
+        // user's selection, dropping any columns the query no longer returns.
+        setTableColumns((prev) => {
+          const kept = prev.filter((c) => validation.fields.includes(c));
+          return kept.length > 0 ? kept : validation.fields;
+        });
+        setTest({
+          status: validation.ok ? "ok" : "error",
+          message: validation.message,
+        });
+      } else {
+        const cell = readDqlCell(records);
+        const validation = validateDqlResult(cell);
+        setTest({
+          status: validation.ok ? "ok" : "error",
+          message: validation.message,
+        });
+      }
+    } catch (e) {
+      setTest({
+        status: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  // Auto-validate an existing DQL query when editing a DQL tile.
+  useEffect(() => {
+    if (isDql && (initial?.dql ?? "").trim()) {
+      void runDqlTest();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function updateFilter(index: number, next: TileFilter) {
+    setFilters((prev) => prev.map((f, i) => (i === index ? next : f)));
+  }
+
+  function removeFilter(index: number) {
+    setFilters((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function addFilter() {
+    setFilters((prev) => [...prev, { dimension: "", value: "" }]);
+  }
+
+  function updateThreshold(index: number, next: Threshold) {
+    setThresholds((prev) => prev.map((t, i) => (i === index ? next : t)));
+  }
+
+  function removeThreshold(index: number) {
+    setThresholds((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function addThreshold() {
+    setThresholds((prev) => [
+      ...prev,
+      {
+        id: generateId("th"),
+        comparator: "gte",
+        value: 0,
+        color:
+          THRESHOLD_COLOR_PRESETS[prev.length % THRESHOLD_COLOR_PRESETS.length]
+            .color,
+      },
+    ]);
+  }
+
+  function resolveLink(): TileLink | undefined {
+    if (linkChoice === "view" && linkView) {
+      return { type: "view", target: linkView };
+    }
+    if (linkChoice === "url" && linkUrl.trim()) {
+      return { type: "url", target: linkUrl.trim() };
+    }
+    return undefined;
+  }
+
+  const isMetric = source === "metric";
+  const isTable = isDql && dqlDisplay === "table";
+  const canSubmit = isShape
+    ? true
+    : isMarkdown
+      ? markdown.trim().length > 0
+      : isDql
+        ? test.status === "ok" && (!isTable || tableColumns.length > 0)
+        : Boolean(metricKey);
+
+  function handleSubmit() {
+    onSubmit({
+      source,
+      metricKey: isMetric ? metricKey : undefined,
+      aggregation: isMetric ? aggregation : undefined,
+      lookback: isMetric ? lookback : undefined,
+      dql: isDql ? dql.trim() : undefined,
+      dqlDisplay: isDql ? dqlDisplay : undefined,
+      tableColumns: isTable ? tableColumns : undefined,
+      markdown: isMarkdown ? markdown : undefined,
+      // Markdown tiles are a plain text box, not a shape. Table tiles are a
+      // plain surface, so they ignore shape/threshold/value styling entirely.
+      shape: isMarkdown || isTable ? DEFAULT_TILE_SHAPE : shape,
+      rotation: isTable ? undefined : rotation || undefined,
+      lineWeight:
+        !isTable && isLineTileShape(shape) ? lineWeight : undefined,
+      lineDashed:
+        !isTable && isLineTileShape(shape) ? lineDashed : undefined,
+      lineArrows:
+        !isTable && isLineTileShape(shape) ? lineArrows : undefined,
+      shapeOnly: isMarkdown || isShape || isTable ? false : shapeOnly,
+      transparent: isTable ? tableTransparent : bgMode === "transparent",
+      backgroundColor:
+        !isTable && bgMode === "custom" ? bgColor : undefined,
+      valuePosition:
+        isMarkdown || isShape || isTable ? undefined : valuePosition,
+      filters: isMetric
+        ? filters.filter((f) => f.dimension && f.value !== "")
+        : [],
+      thresholds:
+        isMarkdown || isShape || isTable
+          ? []
+          : thresholds.filter((t) => Number.isFinite(t.value)),
+      label: isMarkdown || isShape ? undefined : label.trim() || undefined,
+      unit:
+        isMarkdown || isShape || isTable ? undefined : unit.trim() || undefined,
+      link: isTable ? undefined : resolveLink(),
+    });
+  }
+
+  const dqlQueryState: QueryStateType =
+    test.status === "running"
+      ? "loading"
+      : test.status === "ok"
+        ? "success"
+        : test.status === "error"
+          ? "error"
+          : "idle";
+
+  return (
+    <Flex flexDirection="column" gap={8} style={{ width: "100%" }}>
+      {!isShape && (
+      <ConfigSection title="Data source">
+      {isMarkdown ? (
+        <Flex flexDirection="column" gap={6}>
+          <Text style={fieldLabelStyle}>Markdown content</Text>
+          <CodeEditor
+            language="md"
+            value={markdown}
+            lineWrap
+            placeholder={"## Title\n\nSome **bold** text, a [link](https://…), or notes."}
+            aria-label="Markdown content"
+            onChange={(v) => setMarkdown(v)}
+          />
+          <Text
+            style={{
+              fontSize: 11,
+              fontWeight: 500,
+              color: Colors.Text.Neutral.Default,
+            }}
+          >
+            Supports standard markdown (headings, bold, lists, links, etc.).
+          </Text>
+        </Flex>
+      ) : isDql ? (
+        <Flex flexDirection="column" gap={6}>
+          <Flex flexDirection="column" gap={4}>
+            <Text style={fieldLabelStyle}>Display as</Text>
+            <div style={{ maxWidth: 220 }}>
+              <SelectField
+                value={dqlDisplay}
+                ariaLabel="Display as"
+                onChange={(v) => {
+                  setDqlDisplay(v as DqlDisplay);
+                  // Switching mode changes what "valid" means; re-test.
+                  setTest({ status: "idle", message: "" });
+                }}
+                options={DQL_DISPLAY_OPTIONS}
+              />
+            </div>
+          </Flex>
+          <Text style={fieldLabelStyle}>Custom DQL query</Text>
+          <DQLEditor
+            value={dql}
+            placeholder={
+              isTable
+                ? "fetch logs | fields timestamp, status, content | limit 100"
+                : "timeseries v = avg(dt.host.cpu.usage, scalar:true)"
+            }
+            onChange={(v) => {
+              setDql(v);
+              setTest({ status: "idle", message: "" });
+            }}
+          />
+          <Flex justifyContent="space-between" alignItems="center" gap={8}>
+            <Text
+              style={{
+                fontSize: 11,
+                fontWeight: 500,
+                color:
+                  test.status === "error"
+                    ? Colors.Text.Critical.Default
+                    : test.status === "ok"
+                      ? Colors.Text.Success.Default
+                      : Colors.Text.Neutral.Default,
+              }}
+            >
+              {test.message ||
+                (isTable
+                  ? "Query should return one or more rows."
+                  : "Query must return a single numeric or text value.")}
+            </Text>
+            <RunQueryButton
+              onClick={() => void runDqlTest()}
+              queryState={dqlQueryState}
+            />
+          </Flex>
+          {isTable && (
+            <ColumnPicker
+              fields={tableFields}
+              value={tableColumns}
+              onChange={setTableColumns}
+            />
+          )}
+          {isTable && (
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 12,
+                fontWeight: 500,
+                color: Colors.Text.Neutral.Default,
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={tableTransparent}
+                onChange={(e) => setTableTransparent(e.target.checked)}
+              />
+              Transparent background (show only gridlines &amp; values)
+            </label>
+          )}
+        </Flex>
+      ) : (
+        <>
+          <Flex flexDirection="column" gap={4}>
+            <Text style={fieldLabelStyle}>Metric</Text>
+            <Text
+              style={{ fontSize: 13, fontWeight: 500, wordBreak: "break-all" }}
+            >
+              {metricKey}
+            </Text>
+          </Flex>
+
+          <Flex gap={8}>
+            <Flex flexDirection="column" gap={4} style={{ flex: 1 }}>
+              <Text style={fieldLabelStyle}>Aggregation</Text>
+              <SelectField
+                value={aggregation}
+                ariaLabel="Aggregation"
+                onChange={(v) => setAggregation(v as AggregationType)}
+                options={AGGREGATIONS}
+              />
+            </Flex>
+            <Flex flexDirection="column" gap={4} style={{ flex: 1 }}>
+              <Text style={fieldLabelStyle}>Aggregation window</Text>
+              <SelectField
+                value={lookback}
+                ariaLabel="Aggregation window"
+                onChange={(v) => setLookback(v as LookbackWindow)}
+                options={LOOKBACK_OPTIONS}
+              />
+            </Flex>
+          </Flex>
+
+          <Flex flexDirection="column" gap={6}>
+            <Flex justifyContent="space-between" alignItems="center">
+              <Text style={fieldLabelStyle}>Filters</Text>
+              <Button variant="default" onClick={addFilter}>
+                <Button.Prefix>
+                  <PlusIcon />
+                </Button.Prefix>
+                Add filter
+              </Button>
+            </Flex>
+            {filters.length === 0 ? (
+              <Text
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: Colors.Text.Neutral.Default,
+                }}
+              >
+                No filters — the metric is aggregated across all series.
+              </Text>
+            ) : (
+              filters.map((filter, i) => (
+                <FilterRow
+                  key={i}
+                  metricKey={metricKey ?? ""}
+                  filter={filter}
+                  dimensionOptions={dimensionOptions}
+                  onChange={(next) => updateFilter(i, next)}
+                  onRemove={() => removeFilter(i)}
+                />
+              ))
+            )}
+          </Flex>
+        </>
+      )}
+      </ConfigSection>
+      )}
+
+      {!isTable && (
+      <ConfigSection title="Appearance">
+      {!isMarkdown && (
+      <Flex flexDirection="column" gap={6}>
+        <Text style={fieldLabelStyle}>Tile shape</Text>
+        <Flex gap={6} style={{ flexWrap: "wrap" }}>
+          {(isShape ? [...TILE_SHAPES, ...STATIC_ONLY_SHAPES] : TILE_SHAPES).map(
+            (s) => {
+            const selected = shape === s.value;
+            return (
+              <button
+                key={s.value}
+                type="button"
+                title={s.label}
+                aria-label={s.label}
+                aria-pressed={selected}
+                onClick={() => setShape(s.value)}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 3,
+                  width: 60,
+                  padding: "8px 4px",
+                  cursor: "pointer",
+                  borderRadius: 6,
+                  border: `1px solid ${selected
+                      ? Colors.Border.Primary.Default
+                      : Colors.Border.Neutral.Default
+                    }`,
+                  background: selected
+                    ? Colors.Background.Container.Neutral.Emphasized
+                    : Colors.Background.Surface.Default,
+                  color: shapePickerColor,
+                }}
+              >
+                <ShapeGlyph shape={s.value} size={24} />
+                <span style={{ fontSize: 10, fontWeight: 600 }}>
+                  {SHORT_SHAPE_LABELS[s.value]}
+                </span>
+              </button>
+            );
+          })}
+        </Flex>
+        {!isShape && (
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 12,
+              fontWeight: 500,
+              color: Colors.Text.Neutral.Default,
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={shapeOnly}
+              onChange={(e) => setShapeOnly(e.target.checked)}
+            />
+            Show shape only (hide value &amp; label)
+          </label>
+        )}
+      </Flex>
+      )}
+
+      {!isMarkdown &&
+        !isShape &&
+        !shapeOnly &&
+        isOutlineTileShape(shape) &&
+        !isLineTileShape(shape) && (
+          <Flex flexDirection="column" gap={4} style={{ maxWidth: 220 }}>
+            <Text style={fieldLabelStyle}>Value position</Text>
+            <SelectField
+              value={valuePosition}
+              ariaLabel="Value position"
+              onChange={(v) => setValuePosition(v as ValuePosition)}
+              options={VALUE_POSITION_OPTIONS}
+            />
+            <Text
+              style={{
+                fontSize: 11,
+                fontWeight: 500,
+                color: Colors.Text.Neutral.Default,
+              }}
+            >
+              Move the value &amp; label off the icon so they stay readable.
+            </Text>
+          </Flex>
+        )}
+
+      {isLineTileShape(shape) && (
+        <Flex flexDirection="column" gap={6}>
+          <Text style={fieldLabelStyle}>Line format</Text>
+          <Flex gap={8} style={{ flexWrap: "wrap" }}>
+            <Flex flexDirection="column" gap={4} style={{ width: 96 }}>
+              <Text style={fieldLabelStyle}>Weight</Text>
+              <NativeInput
+                type="number"
+                min={1}
+                max={40}
+                value={String(lineWeight)}
+                aria-label="Line weight"
+                onChange={(e) => {
+                  const n = Math.round(Number(e.target.value));
+                  setLineWeight(
+                    Number.isFinite(n) ? Math.max(1, Math.min(40, n)) : 4,
+                  );
+                }}
+              />
+            </Flex>
+            <Flex flexDirection="column" gap={4} style={{ width: 120 }}>
+              <Text style={fieldLabelStyle}>Style</Text>
+              <SelectField
+                value={lineDashed ? "dashed" : "solid"}
+                ariaLabel="Line style"
+                onChange={(v) => setLineDashed(v === "dashed")}
+                options={[
+                  { value: "solid", label: "Solid" },
+                  { value: "dashed", label: "Dashed" },
+                ]}
+              />
+            </Flex>
+            <Flex flexDirection="column" gap={4} style={{ width: 140 }}>
+              <Text style={fieldLabelStyle}>Arrowheads</Text>
+              <SelectField
+                value={lineArrows}
+                ariaLabel="Arrowheads"
+                onChange={(v) => setLineArrows(v as LineArrows)}
+                options={LINE_ARROW_OPTIONS}
+              />
+            </Flex>
+          </Flex>
+        </Flex>
+      )}
+
+      <Flex flexDirection="column" gap={6}>
+        <Text style={fieldLabelStyle}>Background</Text>
+        <SelectField
+          value={bgMode}
+          ariaLabel="Background"
+          onChange={(v) => setBgMode(v as "default" | "transparent" | "custom")}
+          options={[
+            { value: "default", label: "Default" },
+            { value: "transparent", label: "Transparent (no shape)" },
+            { value: "custom", label: "Custom color" },
+          ]}
+        />
+        {bgMode === "custom" && (
+          <Flex gap={6} alignItems="center" style={{ flexWrap: "wrap" }}>
+            <input
+              type="color"
+              value={bgColor}
+              aria-label="Background color"
+              onChange={(e) => setBgColor(e.target.value)}
+              style={{
+                width: 36,
+                height: 28,
+                padding: 0,
+                border: "none",
+                background: "none",
+                cursor: "pointer",
+              }}
+            />
+            {THRESHOLD_COLOR_PRESETS.map((preset) => (
+              <button
+                key={preset.color}
+                type="button"
+                title={preset.label}
+                aria-label={preset.label}
+                onClick={() => setBgColor(preset.color)}
+                style={{
+                  width: 18,
+                  height: 18,
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  background: preset.color,
+                  border:
+                    bgColor.toLowerCase() === preset.color.toLowerCase()
+                      ? "2px solid #161616"
+                      : "1px solid rgba(0,0,0,0.2)",
+                }}
+              />
+            ))}
+          </Flex>
+        )}
+      </Flex>
+
+      <Flex flexDirection="column" gap={4}>
+        <Text style={fieldLabelStyle}>Rotation</Text>
+        <Flex gap={6} alignItems="center" style={{ flexWrap: "wrap" }}>
+          <div style={{ width: 96 }}>
+            <NativeInput
+              type="number"
+              min={0}
+              max={359}
+              step={15}
+              value={String(rotation)}
+              aria-label="Rotation in degrees"
+              onChange={(e) => setRotation(normalizeAngle(e.target.value))}
+            />
+          </div>
+          {[0, 90, 180, 270].map((a) => (
+            <Button
+              key={a}
+              variant={rotation === a ? "accent" : "default"}
+              onClick={() => setRotation(a)}
+              style={{ minWidth: "auto", padding: "4px 10px" }}
+            >
+              {a}°
+            </Button>
+          ))}
+        </Flex>
+      </Flex>
+      </ConfigSection>
+      )}
+
+      {!isMarkdown && !isShape && !isTable && (
+        <ConfigSection title="Color thresholds" defaultOpen={false}>
+          <Flex justifyContent="flex-end" alignItems="center">
+            <Button variant="default" onClick={addThreshold}>
+              <Button.Prefix>
+                <PlusIcon />
+              </Button.Prefix>
+              Add threshold
+            </Button>
+          </Flex>
+          {thresholds.length === 0 ? (
+            <Text
+              style={{
+                fontSize: 12,
+                fontWeight: 500,
+                color: Colors.Text.Neutral.Default,
+              }}
+            >
+              No thresholds — the tile uses its default colors.
+            </Text>
+          ) : (
+            <>
+              <Text
+                style={{
+                  fontSize: 11,
+                  fontWeight: 500,
+                  color: Colors.Text.Neutral.Default,
+                }}
+              >
+                Evaluated top to bottom; the first matching rule colors the
+                tile.
+              </Text>
+              {thresholds.map((threshold, i) => (
+                <ThresholdRow
+                  key={threshold.id}
+                  threshold={threshold}
+                  onChange={(next) => updateThreshold(i, next)}
+                  onRemove={() => removeThreshold(i)}
+                />
+              ))}
+            </>
+          )}
+        </ConfigSection>
+      )}
+
+      {!isMarkdown && !isShape && (
+        <ConfigSection title={isTable ? "Label" : "Label & unit"}>
+        <Flex gap={8}>
+        <Flex flexDirection="column" gap={4} style={{ flex: 1 }}>
+          <Text style={fieldLabelStyle}>
+            {isTable ? "Title (optional)" : "Label (optional)"}
+          </Text>
+          <NativeInput
+            value={label}
+            placeholder={isTable ? "Shown above the table" : metricKey ?? "Custom DQL"}
+            onChange={(e) => setLabel(e.target.value)}
+          />
+        </Flex>
+        {!isTable && (
+        <Flex flexDirection="column" gap={4} style={{ width: 90 }}>
+          <Text style={fieldLabelStyle}>Unit</Text>
+          <NativeInput
+            value={unit}
+            placeholder="e.g. %"
+            onChange={(e) => setUnit(e.target.value)}
+          />
+        </Flex>
+        )}
+      </Flex>
+        </ConfigSection>
+      )}
+
+      {!isTable && (
+      <ConfigSection title="Hyperlink" defaultOpen={false}>
+        <SelectField
+          value={linkChoice}
+          ariaLabel="Hyperlink type"
+          onChange={(v) => setLinkChoice(v as LinkChoice)}
+          options={[
+            { value: "none", label: "No link" },
+            { value: "view", label: "Open another canvas" },
+            { value: "url", label: "Open a custom URL" },
+          ]}
+        />
+
+        {linkChoice === "view" && (
+          <SelectField
+            value={linkView}
+            ariaLabel="Target canvas"
+            placeholder={
+              views === null ? "Loading canvases…" : "Select a canvas…"
+            }
+            onChange={(v) => setLinkView(v)}
+            options={(views ?? [])
+              .filter((v) => v.id !== currentViewId)
+              .map((v) => ({ value: v.id, label: v.name }))}
+          />
+        )}
+
+        {linkChoice === "url" && (
+          <NativeInput
+            type="url"
+            value={linkUrl}
+            placeholder="https://example.com/dashboard"
+            aria-label="Custom URL"
+            onChange={(e) => setLinkUrl(e.target.value)}
+          />
+        )}
+
+        <Text
+          style={{
+            fontSize: 11,
+            fontWeight: 500,
+            color: Colors.Text.Neutral.Default,
+          }}
+        >
+          When set, the tile shows a link icon and opens this destination in a
+          new tab when clicked in view mode.
+        </Text>
+      </ConfigSection>
+      )}
+
+      <Flex gap={8} justifyContent="flex-end">
+        {onCancel && (
+          <Button variant="default" onClick={onCancel}>
+            Cancel
+          </Button>
+        )}
+        <Button variant="accent" onClick={handleSubmit} disabled={!canSubmit}>
+          {submitLabel}
+        </Button>
+      </Flex>
+    </Flex>
+  );
+};
